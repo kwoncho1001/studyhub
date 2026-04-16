@@ -9,7 +9,16 @@ export interface Subject {
   mode: 1 | 2;
   personaMode?: 'standard' | 'easy' | 'meme' | 'custom';
   customPersona?: string;
+  studyModeSettings?: StudyModeSettings;
 }
+
+export interface StudyModeSettings {
+  exam: InterpretationMode;
+  lecture: InterpretationMode;
+  recording: InterpretationMode;
+}
+
+export type InterpretationMode = 'PASSIVE' | 'ACTIVE' | 'EXTENSIVE';
 
 export interface Gallery {
   id: string;
@@ -32,6 +41,17 @@ export interface QuizItem {
   feedback?: string;
 }
 
+export interface ExamSession {
+  id: string;
+  subjectId: string;
+  fileId: string;
+  title: string;
+  questions: QuizItem[];
+  score?: number;
+  completed: boolean;
+  createdAt: number;
+}
+
 export interface ConceptPost {
   id: string;
   galleryId: string; // references Gallery.id (the uuid)
@@ -41,6 +61,7 @@ export interface ConceptPost {
   isQuiz: boolean;
   content?: string; // Markdown content for the post
   quizData?: QuizItem[]; // Quiz data if isQuiz is true
+  mappedMaterials?: StudyUnit[]; // Added: Materials mapped to this post
   createdAt: number;
 }
 
@@ -122,11 +143,28 @@ const PAGES_KEY = 'dc-study-hub-pages';
 const SEGMENTS_KEY = 'dc-study-hub-segments';
 const LOCAL_CLUSTERS_KEY = 'dc-study-hub-local-clusters';
 const GLOBAL_GALLERIES_KEY = 'dc-study-hub-global-galleries';
+const EXAM_SESSIONS_KEY = 'dc-study-hub-exam-sessions';
 const FILES_KEY = 'dc-study-hub-files';
 
 // Subjects
 export async function getSubjects(): Promise<Subject[]> {
   return (await get<Subject[]>(SUBJECTS_KEY)) || [];
+}
+// Exam Sessions
+export async function getExamSessionsBySubject(subjectId: string): Promise<ExamSession[]> {
+  const sessions = (await get<ExamSession[]>(EXAM_SESSIONS_KEY)) || [];
+  return sessions.filter((s) => s.subjectId === subjectId).sort((a, b) => b.createdAt - a.createdAt);
+}
+
+export async function saveExamSession(session: ExamSession): Promise<void> {
+  await update(EXAM_SESSIONS_KEY, (val) => [...(val || []), session]);
+}
+
+export async function updateExamSession(id: string, updates: Partial<ExamSession>): Promise<void> {
+  await update(EXAM_SESSIONS_KEY, (val) => {
+    const sessions = val || [];
+    return sessions.map((s) => (s.id === id ? { ...s, ...updates } : s));
+  });
 }
 
 export async function getSubject(id: string): Promise<Subject | undefined> {

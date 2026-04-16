@@ -1,4 +1,5 @@
-import React, { createContext, useContext, useState } from 'react';
+import React, { createContext, useContext, useState, useEffect } from 'react';
+import { updateSubject, getSubjects } from '../lib/db';
 
 export type InterpretationMode = 'PASSIVE' | 'ACTIVE' | 'EXTENSIVE';
 
@@ -26,6 +27,20 @@ export const useStudyMode = () => {
 export const StudyModeProvider: React.FC<{ children: React.ReactNode }> = ({ children }) => {
   const [allSettings, setAllSettings] = useState<SubjectStudyModeSettings>({});
 
+  useEffect(() => {
+    const loadSettings = async () => {
+      const subjects = await getSubjects();
+      const settings: SubjectStudyModeSettings = {};
+      subjects.forEach(s => {
+        if (s.studyModeSettings) {
+          settings[s.id] = s.studyModeSettings;
+        }
+      });
+      setAllSettings(settings);
+    };
+    loadSettings();
+  }, []);
+
   const defaultSettings: StudyModeSettings = {
     exam: 'ACTIVE',
     lecture: 'ACTIVE',
@@ -34,8 +49,9 @@ export const StudyModeProvider: React.FC<{ children: React.ReactNode }> = ({ chi
 
   const getSettings = (subjectId: string) => allSettings[subjectId] || defaultSettings;
 
-  const updateSettings = (subjectId: string, settings: StudyModeSettings) => {
+  const updateSettings = async (subjectId: string, settings: StudyModeSettings) => {
     setAllSettings(prev => ({ ...prev, [subjectId]: settings }));
+    await updateSubject(subjectId, { studyModeSettings: settings });
   };
 
   return (

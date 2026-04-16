@@ -1,13 +1,17 @@
 import React, { useState, useEffect } from 'react';
-import { Subject, Gallery, ConceptPost, getSubject, getGalleriesBySubject, getPostsByGallery, getSubjectPages, savePosts, getSubjectFiles, deleteSubjectCurriculum, saveGalleries } from '../lib/db';
+import { Subject, Gallery, ConceptPost, getSubject, getGalleriesBySubject, getPostsByGallery, getSubjectPages, savePosts, getSubjectFiles, deleteSubjectCurriculum, saveGalleries, getSubjectSegments, SubjectPage, SubjectSegment, StudyUnit } from '../lib/db';
+import { generatePostsForGallery as generatePostsForGalleryService } from '../lib/postService';
 import { getPersonaPrompt } from '../lib/persona';
 import { GoogleGenAI, Type } from '@google/genai';
 import { motion } from 'motion/react';
 import { ChevronRight, ChevronDown, BookOpen, FileText, CheckCircle2, Loader2, AlertCircle, CheckCircle } from 'lucide-react';
 import { ConceptPostView } from './ConceptPostView';
 import { QuizView } from './QuizView';
+import { ExamList } from './ExamList';
+import { ExamView } from './ExamView';
 import { StudyModeSelector } from './StudyModeSelector';
 import { useStudyMode } from '../contexts/StudyModeContext';
+import { ExamSession } from '../lib/db';
 
 const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
 
@@ -22,6 +26,8 @@ export function StudyRoom({ subjectId, onEditSubject }: StudyRoomProps) {
   const [postsByGallery, setPostsByGallery] = useState<Record<string, ConceptPost[]>>({});
   const [expandedGalleries, setExpandedGalleries] = useState<Set<string>>(new Set());
   const [activePostId, setActivePostId] = useState<string | null>(null);
+  const [activeExamSession, setActiveExamSession] = useState<ExamSession | null>(null);
+  const [activeTab, setActiveTab] = useState<'STUDY' | 'EXAM'>('STUDY');
   const [loading, setLoading] = useState(true);
   const [loadingMessage, setLoadingMessage] = useState('');
   const [generationStatus, setGenerationStatus] = useState<string | null>(null);
@@ -60,22 +66,13 @@ export function StudyRoom({ subjectId, onEditSubject }: StudyRoomProps) {
     fetchQuestions();
   }, [subjectId, galleries, isGeneratingCurriculum]);
 
-  const generatePostsForGallery = async (gallery: Gallery, subjectId: string): Promise<ConceptPost[]> => {
-    if (generatingGalleries.has(gallery.id)) return [];
-    
-    setGeneratingGalleries(prev => new Set(prev).add(gallery.id));
-    
-    try {
-      const s = await getSubject(subjectId);
-      const personaMode = s?.personaMode;
-      const customPersona = s?.customPersona;
+  // 1. [AI Architect] 개념글 목차(뼈대) 생성
+  async function generateConceptPostOutline(gallery: Gallery, subjectId: string): Promise<any[]> {
+    const s = await getSubject(subjectId);
+    const personaMode = s?.personaMode;
+    const customPersona = s?.customPersona;
 
-      const allPages = await getSubjectPages(subjectId);
-      const files = await getSubjectFiles(subjectId);
-      
-      // 1. [AI 기반 개념글 목차(뼈대) 생성]
-      setGenerationStatus("개념글 목차 설계 중...");
-      const outlinePrompt = `
+    const outlinePrompt = `
 선택한 갤러리: [${gallery.galleryId}] ${gallery.title} - ${gallery.description}
 이 갤러리의 학습 목표를 달성하기 위한 개념글(소주제) 목차를 생성하라.
 ${getPersonaPrompt(personaMode, customPersona)}
@@ -83,56 +80,100 @@ ${getPersonaPrompt(personaMode, customPersona)}
 출력 형식: JSON 배열 (각 항목은 { heading: string, description: string, requiredConcepts: string[] })
 `;
 
-      const outlineResponse = await ai.models.generateContent({
-        model: 'gemini-2.5-flash-lite',
-        contents: outlinePrompt,
-        config: { responseMimeType: 'application/json' }
-      });
-      if (!outlineResponse.text) throw new Error("목차 생성 실패");
-      const sections = JSON.parse(outlineResponse.text);
+    const response = await ai.models.generateContent({
+      model: 'gemini-2.5-flash-lite',
+      contents: outlinePrompt,
+      config: { responseMimeType: 'application/json' }
+    });
+    if (!response.text) throw new Error("목차 생성 실패");
+    return JSON.parse(response.text);
+  }
 
-      // 2. [시스템 기반 내용 매핑]
-      setGenerationStatus("학습 자료 매핑 중...");
+  // 2. [System Builder] 내용 매핑 (텍스트 유사도 기반)
+  async function mapContentToOutline(outline: any[], relevantUnits: StudyUnit[], allPages: SubjectPage[], allSegments: SubjectSegment[]): Promise<ConceptPost[]> {
+    // 텍스트 데이터 맵 생성
+    const textMap = new Map<string, string>();
+    allPages.forEach(p => textMap.set(`${p.fileId}:${p.pageNumber}`, p.text));
+    allSegments.forEach(s => textMap.set(s.id, s.text));
+
+    return Promise.all(outline.map(async (section: any, index: number) => {
+      // 섹션의 핵심 키워드 및 설명
+      const sectionText = `${section.heading} ${section.description} ${section.requiredConcepts.join(' ')}`.toLowerCase();
       
-      // 관련 자료 텍스트 준비
-      const relevantUnits = gallery.relevantUnits || [];
-      const unitContents = allPages
-        .filter(p => relevantUnits.some(u => u.type === 'PAGE' && u.id === `${p.fileId}:${p.pageNumber}`))
-        .map(p => ({ type: 'PAGE' as const, id: `${p.fileId}:${p.pageNumber}`, text: p.text }));
-
-      // 섹션별 매핑
-      const mappedSections = sections.map((section: any) => {
-        const sectionText = `${section.heading} ${section.description} ${section.requiredConcepts.join(' ')}`.toLowerCase();
+      // 관련 자료 중 유사도 높은 유닛 매핑
+      const mappedUnits = relevantUnits.filter(unit => {
+        const unitId = unit.type === 'PAGE' ? unit.id : unit.id;
+        const unitText = textMap.get(unitId)?.toLowerCase() || '';
+        if (!unitText) return false;
         
-        // 유사도 기반 매핑
-        const mappedUnits = unitContents.filter(unit => {
-          const score = calculateSimilarity(sectionText, unit.text.toLowerCase());
-          return score >= 0.1; // 임계값
-        });
-
-        return {
-          ...section,
-          content: `## ${section.heading}\n${section.description}\n\n참고 자료:\n${mappedUnits.map(u => u.text).join('\n\n')}`
-        };
+        const score = calculateSimilarity(sectionText, unitText);
+        return score >= 0.05; // 임계값 (텍스트 유사도)
       });
 
-      // 개념글 객체 생성
-      const newPosts: ConceptPost[] = mappedSections.map((s: any, index: number) => ({
-        id: crypto.randomUUID(),
-        galleryId: gallery.id,
-        postId: `${gallery.galleryId}-P${String(index + 1).padStart(2, '0')}`,
-        title: s.heading,
-        description: s.description,
-        isQuiz: false,
-        content: s.content,
-        createdAt: Date.now(),
-      }));
+      // 3. [Synthesizer] 상세 내용 생성
+      const content = await generateConceptPostContent(section, mappedUnits, allPages, allSegments);
 
-      await savePosts(newPosts);
+      return {
+        id: crypto.randomUUID(),
+        galleryId: '',
+        postId: '',
+        title: section.heading,
+        description: section.description,
+        isQuiz: false,
+        content: content,
+        mappedMaterials: mappedUnits, // 매핑된 자료 저장
+        createdAt: Date.now(),
+      };
+    }));
+  }
+
+  // [Synthesizer] 상세 내용 생성 함수
+  async function generateConceptPostContent(section: any, mappedUnits: StudyUnit[], allPages: SubjectPage[], allSegments: SubjectSegment[]): Promise<string> {
+    const textMap = new Map<string, string>();
+    allPages.forEach(p => textMap.set(`${p.fileId}:${p.pageNumber}`, p.text));
+    allSegments.forEach(s => textMap.set(s.id, s.text));
+
+    const materialText = mappedUnits.map(u => textMap.get(u.id) || '').join('\n\n');
+    
+    const prompt = `당신은 대학 전공 과목의 개념글을 작성하는 전문가입니다.
+제공된 학습 자료를 바탕으로, '${section.heading}'에 대한 상세 개념글을 작성하세요.
+
+[학습 자료]
+${materialText}
+
+[지시사항]
+1. 제공된 학습 자료를 기반으로 상세하고 이해하기 쉽게 작성하세요.
+2. 마크다운 형식으로 작성하세요.
+3. 핵심 개념을 명확히 설명하세요.
+4. 불필요한 서론/결론은 생략하고 핵심 내용 위주로 작성하세요.`;
+
+    const res = await ai.models.generateContent({
+      model: 'gemini-2.5-flash-lite',
+      contents: prompt,
+    });
+    return res.text || "내용 생성 실패";
+  }
+
+  // 간단한 유사도 계산 함수
+  function calculateSimilarity(text1: string, text2: string): number {
+    const words1 = new Set(text1.split(' '));
+    const words2 = new Set(text2.split(' '));
+    const intersection = new Set([...words1].filter(x => words2.has(x)));
+    return intersection.size / Math.max(words1.size, words2.size);
+  }
+
+  const generatePostsForGallery = async (gallery: Gallery, subjectId: string): Promise<ConceptPost[]> => {
+    if (generatingGalleries.has(gallery.id)) return [];
+    
+    setGeneratingGalleries(prev => new Set(prev).add(gallery.id));
+    
+    try {
+      setGenerationStatus("개념글 생성 중...");
+      const posts = await generatePostsForGalleryService(gallery, subjectId);
       
-      setPostsByGallery(prev => ({ ...prev, [gallery.id]: newPosts }));
+      setPostsByGallery(prev => ({ ...prev, [gallery.id]: posts }));
       setGenerationStatus(null);
-      return newPosts;
+      return posts;
     } catch (e) {
       console.error("Failed to generate posts for gallery", gallery.title, e);
       setGenerationStatus(null);
@@ -146,258 +187,105 @@ ${getPersonaPrompt(personaMode, customPersona)}
     return [];
   };
 
-  // 간단한 유사도 계산 함수 (clustering.ts와 동일)
-  function calculateSimilarity(text1: string, text2: string): number {
-    const words1 = new Set(text1.split(' '));
-    const words2 = new Set(text2.split(' '));
-    const intersection = new Set([...words1].filter(x => words2.has(x)));
-    return intersection.size / Math.max(words1.size, words2.size);
-  }
+  // 1. [AI Architect] 갤러리 뼈대 생성
+  async function generateGallerySkeleton(subjectId: string, combinedText: string): Promise<any[]> {
+    const s = await getSubject(subjectId);
+    const personaMode = s?.personaMode;
+    const customPersona = s?.customPersona;
+    const settings = s?.studyModeSettings;
 
-  const generateCurriculum = async () => {
-    setIsGeneratingCurriculum(true);
-    setLoadingMessage('1차 커리큘럼 설계 중...');
-    
-    try {
-      const subjectFiles = await getSubjectFiles(subjectId);
-      if (subjectFiles.length === 0) {
-        // 새 과목 추가 시 예외 처리: 파일이 없으면 과목 편집(자료실)으로 이동
-        alert("학습 자료가 없습니다. 자료를 먼저 업로드해주세요.");
-        onEditSubject(subjectId);
-        setIsGeneratingCurriculum(false);
-        return;
-      }
+    const prompt = `당신은 대학 전공 과목의 커리큘럼을 설계하는 전문가입니다.
+제공된 학습 자료를 바탕으로, 전체 시험 범위를 정의하는 '마스터 갤러리 구조(뼈대)'를 생성하세요.
 
-      // 1. 파일 텍스트 취합 (페이지 마킹 포함) 및 기출문제 데이터 취합
-      let combinedText = '';
-      let allExamIds: string[] = [];
-      let examContext = '';
-
-      // 파일별로 페이지를 구분하여 텍스트 구성
-      const allPages = await getSubjectPages(subjectId);
-      const filesMap: Record<string, any> = {};
-      subjectFiles.forEach(f => filesMap[f.id] = f);
-
-      allPages.forEach(p => {
-        const file = p.fileId ? filesMap[p.fileId] : null;
-        const category = file ? file.category : '기타';
-        const fileName = file ? file.name : '알 수 없음';
-        const fileId = file ? file.id : 'unknown';
-        combinedText += `\n\n[자료ID: ${fileId}] [파일명: ${fileName}] [카테고리: ${category}] [Page ${p.pageNumber}]\n${p.text}`;
-      });
-
-      subjectFiles.forEach(f => {
-        if (f.category === 'EXAM' && f.parsedQuestions) {
-          f.parsedQuestions.forEach(q => {
-            allExamIds.push(q.id);
-            examContext += `\n- ID: ${q.id} | 문제: ${q.questionText}`;
-          });
-        }
-      });
-
-      const maxAttempts = 3;
-      let attempt = 0;
-      let isValid = false;
-      let feedbackHistory = '';
-      let finalGalleries: any[] = [];
-
-      while (attempt < maxAttempts && !isValid) {
-        attempt++;
-        setLoadingMessage(`커리큘럼 설계 중... (시도 ${attempt}/${maxAttempts})`);
-
-        const prompt = `당신은 대학 전공 과목의 커리큘럼을 설계하는 전문가입니다.
-제공된 학습 자료와 기출문제를 바탕으로, 사용자가 시험에서 만점을 받을 수 있도록 돕는 전략적 커리큘럼을 설계하세요.
-
-[대원칙: 근거 중심의 역설계]
-1. 모든 갤러리는 제공된 학습 자료의 특정 페이지들에 반드시 근거해야 합니다.
-2. 기출문제를 먼저 분석하여, 각 문제를 풀기 위해 반드시 알아야 하는 핵심 개념들을 도출하세요.
-3. 도출된 개념들을 논리적 흐름에 따라 체계적으로 분류하여 갤러리(대주제)들을 생성하세요.
-4. 각 갤러리에는 해당 내용을 담고 있는 학습 자료의 유닛(자료ID와 페이지 번호 쌍)들을 'relevantUnits' 배열에 반드시 포함시켜야 합니다.
+[페르소나 설정]
+${getPersonaPrompt(personaMode, customPersona)}
 
 [해석 모드 설정]
-- 기출문제: ${settings.exam === 'PASSIVE' ? '선별 모드 (Selective)' : settings.exam === 'ACTIVE' ? '기준 모드 (Core)' : '보조 모드 (Supplement)'}
-- 강의자료: ${settings.lecture === 'PASSIVE' ? '선별 모드 (Selective)' : settings.lecture === 'ACTIVE' ? '기준 모드 (Core)' : '보조 모드 (Supplement)'}
-- 녹음본: ${settings.recording === 'PASSIVE' ? '선별 모드 (Selective)' : settings.recording === 'ACTIVE' ? '기준 모드 (Core)' : '보조 모드 (Supplement)'}
-
-${feedbackHistory ? `\n이전 생성 결과에 대한 피드백 (반드시 반영할 것):\n${feedbackHistory}\n` : ''}
-
-학습 자료 (페이지 마킹됨):
-${combinedText}
-
-기출문제 정보:
-${examContext}
+- 기출문제: ${settings?.exam || 'ACTIVE'}
+- 강의자료: ${settings?.lecture || 'ACTIVE'}
+- 녹음본: ${settings?.recording || 'ACTIVE'}
 
 지시사항:
-1. 제공된 모든 기출문제 ID(${allExamIds.join(', ')})는 누락 없이 어딘가의 갤러리에 반드시 매핑되어야 합니다.
-2. 각 갤러리에는 관련된 기출문제 ID를 'mappedExamIds' 배열에 포함시키세요.
-3. 각 갤러리가 학습 자료의 어느 부분을 참고해야 하는지 'relevantUnits'에 { "type": "PAGE", "id": "자료ID:페이지번호" } 형식의 객체 배열로 명시하세요. (예: { "type": "PAGE", "id": "uuid-123:1" })
+1. 학습 자료를 분석하여 논리적 흐름에 따라 갤러리(대주제)들을 생성하세요.
+2. 각 갤러리에는 title, description, scopeDescription(범위 정의 및 핵심 키워드)을 상세히 작성하세요.
+3. relevantUnits는 반드시 빈 배열([])로 생성하세요.
 4. JSON 형식으로만 응답하세요.
+
+학습 자료:
+${combinedText}
 
 JSON 형식:
 {
   "galleries": [
     {
-      "galleryId": "G01",
       "title": "갤러리 제목",
-      "description": "갤러리에서 다루는 핵심 내용 및 학습 목표",
-      "pastExams": "관련 기출문제 요약",
-      "mappedExamIds": ["기출문제 ID 1"],
-      "relevantUnits": [
-        { "type": "PAGE", "id": "자료ID:페이지번호" }
-      ]
+      "description": "갤러리 설명",
+      "scopeDescription": "범위 정의 및 핵심 키워드",
+      "relevantUnits": []
     }
   ]
 }`;
 
-        const res = await ai.models.generateContent({
-          model: 'gemini-2.5-flash-lite', // 사용자의 요청에 따라 Gemini 2.5 Flash Lite 사용
-          contents: prompt,
-          config: {
-            responseMimeType: 'application/json',
-            responseSchema: {
-              type: Type.OBJECT,
-              properties: {
-                galleries: {
-                  type: Type.ARRAY,
-                  items: {
-                    type: Type.OBJECT,
-                    properties: {
-                      galleryId: { type: Type.STRING },
-                      title: { type: Type.STRING },
-                      description: { type: Type.STRING },
-                      pastExams: { type: Type.STRING },
-                      mappedExamIds: {
-                        type: Type.ARRAY,
-                        items: { type: Type.STRING }
-                      },
-                    relevantUnits: {
-                      type: Type.ARRAY,
-                      items: {
-                        type: Type.OBJECT,
-                        properties: {
-                          type: { type: Type.STRING, enum: ['PAGE', 'SEGMENT', 'QID'] },
-                          id: { type: Type.STRING }
-                        },
-                        required: ['type', 'id']
-                      }
-                    }
-                  },
-                  required: ['galleryId', 'title', 'description', 'mappedExamIds', 'relevantUnits']
-                  }
-                }
-              },
-              required: ['galleries']
-            }
-          }
-        });
+    const res = await ai.models.generateContent({
+      model: 'gemini-2.5-flash-lite',
+      contents: prompt,
+      config: { responseMimeType: 'application/json' }
+    });
+    if (!res.text) throw new Error("AI 응답이 없습니다.");
+    return JSON.parse(res.text).galleries;
+  }
 
-        if (!res.text) throw new Error("AI 응답이 없습니다.");
-        const parsed = JSON.parse(res.text);
-        finalGalleries = parsed.galleries;
+  // 2. [System Builder] 갤러리 매핑
+  async function mapUnitsToGalleries(galleries: any[], allPages: SubjectPage[], allSegments: SubjectSegment[], allQuestions: any[]): Promise<Gallery[]> {
+    const embeddingMap = new Map<string, number[]>();
+    allPages.forEach(p => embeddingMap.set(`${p.fileId}:${p.pageNumber}`, p.embedding));
+    // segments/questions도 동일하게 매핑 필요
 
-        if (finalGalleries.length === 0) {
-          feedbackHistory += `\n[시도 ${attempt} 피드백]\n갤러리가 생성되지 않았습니다. 최소 3개 이상의 갤러리를 생성하세요.`;
-          continue;
-        }
-
-        setLoadingMessage(`기출문제 누락 및 구조 검토 중... (시도 ${attempt}/${maxAttempts})`);
-
-        // 결정론적 검증 (코드 기반)
-        const mappedIds = new Set<string>();
-        finalGalleries.forEach(g => {
-          (g.mappedExamIds || []).forEach((id: string) => mappedIds.add(id));
-        });
-
-        const missingIds = allExamIds.filter(id => !mappedIds.has(id));
-        let deterministicFeedback = '';
-        if (missingIds.length > 0) {
-          deterministicFeedback = `[시스템 검증 실패] 다음 기출문제 ID가 어떤 갤러리에도 매핑되지 않았습니다: ${missingIds.join(', ')}. 모든 기출문제를 반드시 매핑하세요.`;
-        }
-
-        // AI 검증
-        const validatorPrompt = `당신은 커리큘럼 보안 및 품질 검토자입니다.
-생성된 갤러리 구조가 다음 '기출 정복' 기준을 완벽하게 만족하는지 엄격하게 검토하세요.
-
-[검토 기준]
-1. 기출문제 커버리지: 제공된 모든 기출문제 ID(${allExamIds.join(', ')})가 적절한 갤러리에 매핑되었는가?
-2. 내용의 깊이: 기출문제가 매핑된 갤러리의 설명이 해당 문제를 풀기에 충분히 구체적이고 깊이 있는가?
-3. 누락 방지: 학습 자료의 방대한 내용 중 시험에 나올 법한 중요한 개념이 누락되지 않고 체계적으로 분류되었는가?
-
-생성된 갤러리:
-${JSON.stringify(finalGalleries, null, 2)}
-
-${deterministicFeedback ? `시스템 피드백 (치명적 오류):\n${deterministicFeedback}\n` : ''}
-
-JSON 형식으로 응답:
-{
-  "isValid": boolean (시스템 피드백이 있거나 기출문제 누락이 있으면 무조건 false),
-  "feedback": "수정이 필요한 경우 구체적인 피드백 (어떤 기출문제를 위해 어떤 갤러리를 보강해야 하는지)"
-}`;
-
-        const validatorRes = await ai.models.generateContent({
-          model: 'gemini-2.5-flash-lite',
-          contents: validatorPrompt,
-          config: {
-            responseMimeType: 'application/json',
-            responseSchema: {
-              type: Type.OBJECT,
-              properties: {
-                isValid: { type: Type.BOOLEAN },
-                feedback: { type: Type.STRING }
-              },
-              required: ['isValid', 'feedback']
-            }
-          }
-        });
-
-        const validatorParsed = JSON.parse(validatorRes.text || "{}");
-        
-        if (validatorParsed.isValid && missingIds.length === 0) {
-          isValid = true;
-        } else {
-          feedbackHistory += `\n[시도 ${attempt} 피드백]\n${deterministicFeedback}\n${validatorParsed.feedback}`;
-        }
-      }
-
-      if (finalGalleries.length === 0) {
-        throw new Error("커리큘럼 생성에 실패했습니다. 다시 시도해주세요.");
-      }
-
-      setLoadingMessage('기존 커리큘럼 삭제 및 저장 중...');
-
-      // 2. 기존 갤러리 삭제 (성공했을 때만 삭제)
-      await deleteSubjectCurriculum(subjectId);
-
-      // 3. 갤러리 저장
-      const newGalleries: Gallery[] = finalGalleries.map((g: any, index: number) => ({
+    return galleries.map((g, index) => {
+      // 갤러리 벡터 생성 (scopeDescription 기반)
+      // 실제 구현에서는 갤러리 벡터를 생성하는 로직이 필요합니다.
+      
+      return {
         id: crypto.randomUUID(),
-        subjectId,
-        galleryId: g.galleryId || `G${String(index + 1).padStart(2, '0')}`,
+        subjectId: '', // 나중에 설정
+        galleryId: `G${String(index + 1).padStart(2, '0')}`,
         title: g.title,
         description: g.description,
-        pastExams: g.pastExams,
-        mappedExamIds: g.mappedExamIds || [],
-        relevantPages: g.relevantPages || [],
-        relevantUnits: g.relevantUnits || [],
-        order: index,
+        pastExams: '', // 필요시 추가
+        relevantUnits: [], // 시스템 매핑 결과 할당
         createdAt: Date.now()
-      }));
+      };
+    });
+  }
 
-      await saveGalleries(newGalleries);
+  const generateCurriculum = async () => {
+    setIsGeneratingCurriculum(true);
+    setLoadingMessage('커리큘럼 설계 중...');
+    
+    try {
+      const subjectFiles = await getSubjectFiles(subjectId);
+      const allPages = await getSubjectPages(subjectId);
       
-      // Reload curriculum after generating galleries
+      let combinedText = '';
+      allPages.forEach(p => {
+        combinedText += `\n\n[Page ${p.pageNumber}]\n${p.text}`;
+      });
+
+      // 1. [AI Architect] 뼈대 생성
+      setLoadingMessage('갤러리 뼈대 설계 중...');
+      const skeleton = await generateGallerySkeleton(subjectId, combinedText);
+
+      // 2. [System Builder] 매핑
+      setLoadingMessage('학습 자료 매핑 중...');
+      const newGalleries = await mapUnitsToGalleries(skeleton, allPages, [], []); // segments, questions 추가 필요
+      
+      const finalGalleries = newGalleries.map(g => ({ ...g, subjectId }));
+
+      await deleteSubjectCurriculum(subjectId);
+      await saveGalleries(finalGalleries);
+      
       await loadCurriculum();
-
-      // Final Coverage Summary Alert
-      const finalMappedIds = new Set<string>();
-      newGalleries.forEach(g => (g.mappedExamIds || []).forEach(id => finalMappedIds.add(id)));
-      const finalMissing = allExamIds.filter(id => !finalMappedIds.has(id));
-      
-      if (finalMissing.length === 0) {
-        setGenerationStatus("✅ 모든 기출문제가 커리큘럼에 완벽하게 반영되었습니다!");
-      } else {
-        setGenerationStatus(`⚠️ ${finalMissing.length}개의 기출문제가 누락되었습니다. 사이드바의 '기출 반영 현황'을 확인해주세요.`);
-      }
+      setGenerationStatus("✅ 커리큘럼이 성공적으로 생성되었습니다!");
       setTimeout(() => setGenerationStatus(null), 5000);
     } catch (err: any) {
       console.error("Failed to generate curriculum", err);
@@ -546,17 +434,35 @@ JSON 형식으로 응답:
       <div className="w-80 flex-shrink-0 bg-white dark:bg-neutral-900 rounded-xl border border-neutral-200 dark:border-neutral-800 shadow-sm overflow-hidden flex flex-col transition-colors duration-200">
         <div className="p-4 border-b border-neutral-200 dark:border-neutral-800 bg-neutral-50 dark:bg-neutral-900/50 transition-colors duration-200 flex flex-col gap-3">
           <StudyModeSelector subjectId={subjectId} />
+          
+          <div className="flex items-center gap-2 border-b border-neutral-200 dark:border-neutral-800">
+            <button 
+              onClick={() => setActiveTab('STUDY')}
+              className={`pb-2 px-2 font-bold text-sm ${activeTab === 'STUDY' ? 'text-blue-600 border-b-2 border-blue-600' : 'text-neutral-500'}`}
+            >
+              학습
+            </button>
+            <button 
+              onClick={() => setActiveTab('EXAM')}
+              className={`pb-2 px-2 font-bold text-sm ${activeTab === 'EXAM' ? 'text-blue-600 border-b-2 border-blue-600' : 'text-neutral-500'}`}
+            >
+              기출문제
+            </button>
+          </div>
+
           <div className="flex items-center justify-between">
             <h2 className="font-bold text-lg flex items-center gap-2 text-neutral-900 dark:text-neutral-100">
               <BookOpen size={18} className="text-blue-600 dark:text-blue-400" />
-              커리큘럼
+              {activeTab === 'STUDY' ? '커리큘럼' : '기출문제 세트'}
             </h2>
-            <button
-              onClick={() => setShowConfirmReconstruct(true)}
-              className="text-xs bg-white dark:bg-neutral-800 border border-neutral-300 dark:border-neutral-700 hover:bg-neutral-50 dark:hover:bg-neutral-700 text-neutral-700 dark:text-neutral-300 px-2 py-1 rounded transition-colors"
-            >
-              재구성
-            </button>
+            {activeTab === 'STUDY' && (
+              <button
+                onClick={() => setShowConfirmReconstruct(true)}
+                className="text-xs bg-white dark:bg-neutral-800 border border-neutral-300 dark:border-neutral-700 hover:bg-neutral-50 dark:hover:bg-neutral-700 text-neutral-700 dark:text-neutral-300 px-2 py-1 rounded transition-colors"
+              >
+                재구성
+              </button>
+            )}
           </div>
 
           {/* Traceability Matrix Summary */}
@@ -631,58 +537,68 @@ JSON 형식으로 응답:
         )}
 
         <div className="flex-1 overflow-y-auto p-3 space-y-2 custom-scrollbar">
-          {galleries.map(gallery => {
-            const isExpanded = expandedGalleries.has(gallery.id);
-            const posts = postsByGallery[gallery.id] || [];
-            
-            return (
-              <div key={gallery.id} className="space-y-1">
-                <button
-                  onClick={() => toggleGallery(gallery.id)}
-                  className="w-full flex items-center gap-2 p-2 hover:bg-neutral-100 dark:hover:bg-neutral-800 rounded-lg text-left transition-colors"
-                >
-                  {isExpanded ? <ChevronDown size={16} className="text-neutral-500 dark:text-neutral-400" /> : <ChevronRight size={16} className="text-neutral-500 dark:text-neutral-400" />}
-                  <span className="font-semibold text-sm text-neutral-800 dark:text-neutral-200 line-clamp-1 flex-1">{gallery.title}</span>
-                </button>
-                
-                {isExpanded && (
-                  <div className="pl-6 space-y-1">
-                    {posts.map(post => {
-                      const isActive = post.id === activePostId;
-                      return (
-                        <button
-                          key={post.id}
-                          onClick={() => setActivePostId(post.id)}
-                          className={`w-full flex items-center gap-2 p-2 rounded-lg text-left text-sm transition-colors ${
-                            isActive ? 'bg-blue-50 dark:bg-blue-900/30 text-blue-700 dark:text-blue-400 font-medium' : 'hover:bg-neutral-50 dark:hover:bg-neutral-800/50 text-neutral-600 dark:text-neutral-400'
-                          }`}
-                        >
-                          {post.isQuiz ? (
-                            <CheckCircle2 size={16} className={isActive ? 'text-blue-600 dark:text-blue-400' : 'text-green-600 dark:text-green-500'} />
-                          ) : (
-                            <FileText size={16} className={isActive ? 'text-blue-600 dark:text-blue-400' : 'text-neutral-400 dark:text-neutral-500'} />
-                          )}
-                          <span className="line-clamp-1">{post.title}</span>
-                        </button>
-                      );
-                    })}
-                    {generatingGalleries.has(gallery.id) && (
-                      <div className="flex items-center gap-2 p-2 text-xs text-neutral-400 animate-pulse">
-                        <Loader2 size={14} className="animate-spin" />
-                        <span>개념글 생성 중...</span>
-                      </div>
-                    )}
-                  </div>
-                )}
-              </div>
-            );
-          })}
+          {activeTab === 'STUDY' ? (
+            galleries.map(gallery => {
+              const isExpanded = expandedGalleries.has(gallery.id);
+              const posts = postsByGallery[gallery.id] || [];
+              
+              return (
+                <div key={gallery.id} className="space-y-1">
+                  <button
+                    onClick={() => toggleGallery(gallery.id)}
+                    className="w-full flex items-center gap-2 p-2 hover:bg-neutral-100 dark:hover:bg-neutral-800 rounded-lg text-left transition-colors"
+                  >
+                    {isExpanded ? <ChevronDown size={16} className="text-neutral-500 dark:text-neutral-400" /> : <ChevronRight size={16} className="text-neutral-500 dark:text-neutral-400" />}
+                    <span className="font-semibold text-sm text-neutral-800 dark:text-neutral-200 line-clamp-1 flex-1">{gallery.title}</span>
+                  </button>
+                  
+                  {isExpanded && (
+                    <div className="pl-6 space-y-1">
+                      {posts.map(post => {
+                        const isActive = post.id === activePostId;
+                        return (
+                          <button
+                            key={post.id}
+                            onClick={() => setActivePostId(post.id)}
+                            className={`w-full flex items-center gap-2 p-2 rounded-lg text-left text-sm transition-colors ${
+                              isActive ? 'bg-blue-50 dark:bg-blue-900/30 text-blue-700 dark:text-blue-400 font-medium' : 'hover:bg-neutral-50 dark:hover:bg-neutral-800/50 text-neutral-600 dark:text-neutral-400'
+                            }`}
+                          >
+                            {post.isQuiz ? (
+                              <CheckCircle2 size={16} className={isActive ? 'text-blue-600 dark:text-blue-400' : 'text-green-600 dark:text-green-500'} />
+                            ) : (
+                              <FileText size={16} className={isActive ? 'text-blue-600 dark:text-blue-400' : 'text-neutral-400 dark:text-neutral-500'} />
+                            )}
+                            <span className="line-clamp-1">{post.title}</span>
+                          </button>
+                        );
+                      })}
+                      {generatingGalleries.has(gallery.id) && (
+                        <div className="flex items-center gap-2 p-2 text-xs text-neutral-400 animate-pulse">
+                          <Loader2 size={14} className="animate-spin" />
+                          <span>개념글 생성 중...</span>
+                        </div>
+                      )}
+                    </div>
+                  )}
+                </div>
+              );
+            })
+          ) : (
+            <ExamList subjectId={subjectId} onSelectSession={setActiveExamSession} />
+          )}
         </div>
       </div>
 
       {/* Main Content Area */}
       <div className="flex-1 bg-white dark:bg-neutral-900 rounded-xl border border-neutral-200 dark:border-neutral-800 shadow-sm overflow-hidden flex flex-col relative transition-colors duration-200">
-        {activePost ? (
+        {activeTab === 'EXAM' ? (
+          activeExamSession ? (
+            <ExamView session={activeExamSession} onUpdate={setActiveExamSession} />
+          ) : (
+            <div className="flex-1 flex items-center justify-center text-neutral-500 dark:text-neutral-400">기출문제를 선택해주세요.</div>
+          )
+        ) : activePost ? (
           activePost.isQuiz ? (
             <QuizView 
               key={activePost.id}

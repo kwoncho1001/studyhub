@@ -24,10 +24,12 @@ export function ConceptPostView({ post, subjectId, nextPost, onUpdate }: Concept
   const [qnas, setQnas] = useState<PostQnA[]>([]);
   const [question, setQuestion] = useState('');
   const [asking, setAsking] = useState(false);
+  const [files, setFiles] = useState<any[]>([]);
   const messagesEndRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
     loadQnAs();
+    loadFiles();
     
     // Generate current post if needed
     if (!post.content) {
@@ -39,6 +41,20 @@ export function ConceptPostView({ post, subjectId, nextPost, onUpdate }: Concept
       generateContent(nextPost, false);
     }
   }, [post.id]);
+
+  const loadFiles = async () => {
+    const data = await getSubjectFiles(subjectId);
+    setFiles(data);
+  };
+
+  const getMaterialName = (unit: any) => {
+    if (unit.type === 'PAGE') {
+      const [fileId, pageNumber] = unit.id.split(':');
+      const file = files.find(f => f.id === fileId);
+      return file ? `${file.name} (p.${pageNumber})` : `페이지 ${pageNumber}`;
+    }
+    return unit.id;
+  };
 
   const loadQnAs = async () => {
     const data = await getQnAsByPost(post.id);
@@ -240,6 +256,11 @@ ${getPersonaPrompt(personaMode, customPersona)}
               </button>
             </div>
             <p className="text-lg text-neutral-500 dark:text-neutral-400">{post.description}</p>
+            {post.mappedMaterials && post.mappedMaterials.length > 0 && (
+              <div className="text-sm text-neutral-400 dark:text-neutral-500 pt-2">
+                <span className="font-semibold">참고 자료:</span> {post.mappedMaterials.map(m => getMaterialName(m)).join(', ')}
+              </div>
+            )}
           </div>
           
           <div className="prose prose-blue dark:prose-invert max-w-none prose-headings:text-blue-900 dark:prose-headings:text-blue-300 prose-h1:text-3xl prose-h2:text-2xl prose-h3:text-xl prose-p:text-neutral-700 dark:prose-p:text-neutral-300 prose-p:leading-relaxed prose-li:text-neutral-700 dark:prose-li:text-neutral-300 prose-strong:text-blue-800 dark:prose-strong:text-blue-400 prose-strong:font-bold prose-a:text-blue-600 dark:prose-a:text-blue-400 prose-blockquote:border-l-4 prose-blockquote:border-blue-500 dark:prose-blockquote:border-blue-400 prose-blockquote:bg-blue-50 dark:prose-blockquote:bg-blue-900/30 prose-blockquote:py-1 prose-blockquote:px-4 prose-blockquote:not-italic prose-blockquote:text-neutral-700 dark:prose-blockquote:text-neutral-300 rounded-2xl transition-colors duration-200">

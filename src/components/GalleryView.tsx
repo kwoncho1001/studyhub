@@ -174,6 +174,11 @@ ${getPersonaPrompt(subject.personaMode, subject.customPersona)}
           <h2 className="text-2xl font-bold tracking-tight text-neutral-900 dark:text-neutral-100 transition-colors duration-200">{gallery.title}</h2>
         </div>
         <p className="text-neutral-600 dark:text-neutral-400 text-lg transition-colors duration-200">{gallery.description}</p>
+        {gallery.relevantUnits && gallery.relevantUnits.length > 0 && (
+          <div className="text-sm text-neutral-400 dark:text-neutral-500 pt-2">
+            <span className="font-semibold">참고 자료:</span> {gallery.relevantUnits.length}개 자료 매핑됨
+          </div>
+        )}
         {gallery.pastExams && (
           <div className="text-sm text-neutral-500 dark:text-neutral-400 bg-neutral-50 dark:bg-neutral-800/50 p-3 rounded-lg border border-neutral-100 dark:border-neutral-700/50 transition-colors duration-200">
             <span className="font-semibold text-neutral-700 dark:text-neutral-300 mr-2">관련 기출:</span>
